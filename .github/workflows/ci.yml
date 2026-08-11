@@ -1,0 +1,103 @@
+name: build-and-test
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os }} · ${{ matrix.backend }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        backend: [heuristic, zydis, xed]
+        include:
+          # Map each backend to its CMake flags.
+          - backend: heuristic
+            cmake_flags: ""
+          - backend: zydis
+            cmake_flags: "-DWITH_ZYDIS=ON"
+          - backend: xed
+            cmake_flags: "-DWITH_XED=ON"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive   # in case Zydis/XED are added as submodules
+
+      # Intel XED drives its build with Python 3 (mfile.py / mbuild).
+      - name: Set up Python (for XED)
+        if: matrix.backend == 'xed'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      # Provide the MSVC developer environment on Windows so both CMake and
+      # XED's mfile.py can find cl.exe / link.exe.
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: cmake -S . -B build ${{ matrix.cmake_flags }} -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # --- Smoke tests -----------------------------------------------------
+      - name: Smoke test (help + backend banner)
+        shell: bash
+        run: |
+          BIN=build/petool
+          [ -f build/Release/petool.exe ] && BIN="build/Release/petool.exe"
+          [ -f build/petool.exe ] && BIN="build/petool.exe"
+          "$BIN" --help 2>&1 | tee help.txt
+          echo "Expecting backend '${{ matrix.backend }}' in the banner:"
+          grep -qi "${{ matrix.backend }}" help.txt
+
+      - name: Analyze a real PE (Windows) — text, JSON, all decoders
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          BIN="build/Release/petool.exe"; [ -f build/petool.exe ] && BIN="build/petool.exe"
+          TARGET="C:/Windows/System32/kernel32.dll"
+          "$BIN" "$TARGET" --verbose
+          "$BIN" "$TARGET" --scan-all-sections --decoder=${{ matrix.backend }}
+          "$BIN" "$TARGET" --json > out.json
+          python -c "import json;json.load(open('out.json'));print('JSON OK')"
+
+      - name: Analyze a cross-built PE (Linux) — MinGW stub, JSON validate
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get install -y gcc-mingw-w64-x86-64 python3
+          printf 'int main(){return 0;}' > t.c
+          x86_64-w64-mingw32-gcc t.c -o sample.exe
+          ./build/petool sample.exe --verbose
+          ./build/petool sample.exe --scan-all-sections --decoder=${{ matrix.backend }}
+          ./build/petool sample.exe --json > out.json
+          python3 -c "import json;json.load(open('out.json'));print('JSON OK')"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: petool-${{ matrix.os }}-${{ matrix.backend }}
+          path: |
+            build/petool
+            build/petool.exe
+            build/Release/petool.exe
+          if-no-files-found: ignore
