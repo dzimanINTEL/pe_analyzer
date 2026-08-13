@@ -94,9 +94,18 @@ if(WITH_XED)
     FetchContent_MakeAvailable(xed mbuild)
 
     set(_xed_kit "${CMAKE_BINARY_DIR}/xed-install")
+    file(MAKE_DIRECTORY "${_xed_kit}/lib")
+    file(MAKE_DIRECTORY "${_xed_kit}/include")
+
+    if(WIN32)
+        set(_xed_lib "${_xed_kit}/lib/xed.lib")
+    else()
+        set(_xed_lib "${_xed_kit}/lib/libxed.a")
+    endif()
+
     # Build a static libxed with XED's own builder (mbuild must be a sibling dir).
     add_custom_command(
-        OUTPUT  "${_xed_kit}/lib/xed.lib"
+        OUTPUT  "${_xed_lib}"
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${mbuild_SOURCE_DIR}" "${xed_SOURCE_DIR}/../mbuild"
         COMMAND ${Python3_EXECUTABLE} "${xed_SOURCE_DIR}/mfile.py"
@@ -104,15 +113,13 @@ if(WITH_XED)
         WORKING_DIRECTORY "${xed_SOURCE_DIR}"
         COMMENT "Building Intel XED (static) via mfile.py"
         VERBATIM)
-    add_custom_target(build_xed DEPENDS "${_xed_kit}/lib/xed.lib")
+    add_custom_target(build_xed DEPENDS "${_xed_lib}")
 
     add_library(xed_imported STATIC IMPORTED GLOBAL)
     set_target_properties(xed_imported PROPERTIES
-        IMPORTED_LOCATION "${_xed_kit}/lib/xed.lib"
+        IMPORTED_LOCATION "${_xed_lib}"
         INTERFACE_INCLUDE_DIRECTORIES "${_xed_kit}/include")
     add_dependencies(xed_imported build_xed)
-    # Ensure the include dir exists at configure time for the interface.
-    file(MAKE_DIRECTORY "${_xed_kit}/include")
 
     add_dependencies(petool build_xed)
     target_include_directories(petool PRIVATE "${_xed_kit}/include")
