@@ -599,7 +599,15 @@ static bool requiresAvx10_2(xed_isa_set_enum_t is) {
             xed_cpuid_rec_t cr;
             if (!xed_get_cpuid_rec(rec, &cr)) continue;
             // CPUID leaf 0x24 carries the AVX10 converged-vector version field.
-            if (cr.leaf == 0x24 && cr.value >= 2) groupNeedsV2 = true;
+            const bool avx10Version2 =
+                cr.leaf == 0x24 && cr.subleaf == 0 &&
+                cr.reg == XED_REG_EBX && cr.bit_start == 0 &&
+                cr.bit_end == 7 && cr.value >= 2;
+            const bool avx10V2Aux =
+                cr.leaf == 0x24 && cr.subleaf == 1 &&
+                cr.reg == XED_REG_ECX && cr.bit_start == 3 &&
+                cr.bit_end == 3 && cr.value == 1;
+            if (avx10Version2 || avx10V2Aux) groupNeedsV2 = true;
         }
         if (!groupNeedsV2) return false;   // this group is satisfiable without AVX10.2
     }
