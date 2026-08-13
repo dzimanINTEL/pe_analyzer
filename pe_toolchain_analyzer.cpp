@@ -540,7 +540,7 @@ static void scanIsaZydis(const uint8_t* code, size_t len, bool is64,
     while (off < len) {
         if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code + off, len - off,
                                                 &insn, ops))) {
-            if (insn.attributes & ZYDIS_ATTRIB_HAS_REX2) acc.rex2++;
+            if (insn.attributes & ZYDIS_ATTRIB_HAS_REX2) { acc.rex2++; acc.apx++; }
             if (insn.encoding == ZYDIS_INSTRUCTION_ENCODING_EVEX) acc.evex++;
             // ISA-set / extension enums vary by Zydis version; string-match
             // keeps this robust across 4.x builds that added APX/AVX10.
