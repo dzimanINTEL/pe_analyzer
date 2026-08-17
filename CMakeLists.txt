@@ -97,11 +97,7 @@ if(WITH_XED)
     file(MAKE_DIRECTORY "${_xed_kit}/lib")
     file(MAKE_DIRECTORY "${_xed_kit}/include")
 
-    if(WIN32)
-        set(_xed_lib "${_xed_kit}/lib/xed.lib")
-    else()
-        set(_xed_lib "${_xed_kit}/lib/libxed.a")
-    endif()
+    set(_xed_lib "${_xed_kit}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}xed${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
     # Build a static libxed with XED's own builder (mbuild must be a sibling dir).
     add_custom_command(
