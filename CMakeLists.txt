@@ -94,7 +94,11 @@ if(WITH_XED)
     FetchContent_MakeAvailable(xed mbuild)
 
     set(_xed_kit "${CMAKE_BINARY_DIR}/xed-install")
+    file(MAKE_DIRECTORY "${_xed_kit}/lib")
+    file(MAKE_DIRECTORY "${_xed_kit}/include")
+
     set(_xed_lib "${_xed_kit}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}xed${CMAKE_STATIC_LIBRARY_SUFFIX}")
+
     # Build a static libxed with XED's own builder (mbuild must be a sibling dir).
     add_custom_command(
         OUTPUT  "${_xed_lib}"
@@ -112,8 +116,6 @@ if(WITH_XED)
         IMPORTED_LOCATION "${_xed_lib}"
         INTERFACE_INCLUDE_DIRECTORIES "${_xed_kit}/include")
     add_dependencies(xed_imported build_xed)
-    # Ensure the include dir exists at configure time for the interface.
-    file(MAKE_DIRECTORY "${_xed_kit}/include")
 
     add_dependencies(petool build_xed)
     target_include_directories(petool PRIVATE "${_xed_kit}/include")
