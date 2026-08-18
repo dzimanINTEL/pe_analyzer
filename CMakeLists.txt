@@ -97,7 +97,13 @@ if(WITH_XED)
     file(MAKE_DIRECTORY "${_xed_kit}/lib")
     file(MAKE_DIRECTORY "${_xed_kit}/include")
 
-    set(_xed_lib "${_xed_kit}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}xed${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    # XED's mfile.py installs xed.lib on Windows (MSVC, no lib prefix)
+    # and libxed.a on all Unix-like platforms (Linux, macOS, BSD).
+    if(WIN32)
+        set(_xed_lib "${_xed_kit}/lib/xed.lib")
+    else()
+        set(_xed_lib "${_xed_kit}/lib/libxed.a")
+    endif()
 
     # Build a static libxed with XED's own builder (mbuild must be a sibling dir).
     add_custom_command(
