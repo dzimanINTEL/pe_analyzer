@@ -197,9 +197,10 @@ struct AnalysisResult {
     bool definitive = false;         // true => decoder-backed (Zydis/XED) answer
     std::string decoderName = "heuristic"; // heuristic | zydis | xed | n/a
     int  sectionsScanned = 0;        // number of executable sections analyzed
-    uint64_t rex2Count = 0;          // REX2/APX instruction (or candidate) count
+    uint64_t rex2Count = 0;          // REX2 prefix instruction (or candidate) count
     uint64_t evexCount = 0;          // EVEX-encoded instruction (or candidate) count
-    uint64_t avx10Count = 0;         // AVX10-set instruction count (decoder only)
+    uint64_t apxCount = 0;           // APX-requiring instruction count (decoder only)
+    uint64_t avx10Count = 0;         // AVX10.2-requiring instruction count (decoder only)
     std::string isaDetail;
 
     std::vector<Evidence> evidence;
@@ -469,10 +470,10 @@ static void detectPgo(const std::vector<uint8_t>& buf,
 // ---------------------------------------------------------------------------
 // Accumulator so multiple sections (--scan-all-sections) can be aggregated.
 struct IsaCounts {
-    uint64_t rex2 = 0;   // REX2/APX instructions (decoder) or candidates (heuristic)
+    uint64_t rex2 = 0;   // instructions carrying a REX2 prefix, or candidates (heuristic)
     uint64_t evex = 0;   // EVEX-encoded instructions or candidates
-    uint64_t apx  = 0;   // instructions in an APX ISA-set (decoder only)
-    uint64_t avx10 = 0;  // instructions in an AVX10 ISA-set (decoder only)
+    uint64_t apx  = 0;   // instructions requiring APX hardware (decoder only)
+    uint64_t avx10 = 0;  // instructions requiring AVX10.2 hardware (decoder only)
 };
 
 // Runtime decoder backend selection.
@@ -559,11 +560,83 @@ static void scanIsaZydis(const uint8_t* code, size_t len, bool is64,
 #endif
 
 #ifdef USE_XED
+// ---------------------------------------------------------------------------
+//  XED classification tables, computed once at first use.
+//
+//  Neither APX nor AVX10 membership can be recovered from ISA-set *names*:
+//    * XED expresses AVX10 through the CPUID mapping, not by renaming ISA-sets.
+//      An AVX10.2-capable instruction usually reports AVX512F_512 / AVX512BW_128
+//      and carries both an AVX10 CPUID group and a legacy AVX-512 group.
+//    * Legacy instructions carrying a REX2 prefix, and EVEX instructions using
+//      EGPRs, are given no new iform and no new ISA-set at all.
+//  So the tables below walk the CPUID group records per ISA-set, and the scan
+//  loop uses encoding-space fields plus a chip check on the decoded instruction.
+// ---------------------------------------------------------------------------
+namespace xedcls {
+
+static const uint8_t REQUIRES_AVX10_2 = 1u << 0;
+
+struct Tables {
+    std::vector<uint8_t> isaFlags;                    // by xed_isa_set_enum_t
+    xed_extension_enum_t apxLegacy = XED_EXTENSION_INVALID;
+    xed_extension_enum_t apxEvex   = XED_EXTENSION_INVALID;
+    xed_chip_enum_t      preApx    = XED_CHIP_INVALID; // newest pre-APX chip
+};
+
+// True only when *every* CPUID group satisfying this ISA-set demands AVX10
+// version >= 2. A set that also has a plain AVX-512 group runs on pre-AVX10
+// hardware and must not be counted as AVX10.2.
+static bool requiresAvx10_2(xed_isa_set_enum_t is) {
+    bool anyGroup = false;
+    for (unsigned g = 0; g < XED_MAX_CPUID_GROUPS_PER_ISA_SET; ++g) {
+        xed_cpuid_group_enum_t grp = xed_get_cpuid_group_enum_for_isa_set(is, g);
+        if (grp == XED_CPUID_GROUP_INVALID) continue;
+        anyGroup = true;
+        bool groupNeedsV2 = false;
+        for (unsigned k = 0; k < XED_MAX_CPUID_RECS_PER_GROUP; ++k) {
+            xed_cpuid_rec_enum_t rec = xed_get_cpuid_rec_enum_for_group(grp, k);
+            if (rec == XED_CPUID_REC_INVALID) continue;
+            xed_cpuid_rec_t cr;
+            if (!xed_get_cpuid_rec(rec, &cr)) continue;
+            // CPUID leaf 0x24 carries the AVX10 converged-vector version field.
+            const bool avx10Version2 =
+                cr.leaf == 0x24 && cr.subleaf == 0 &&
+                cr.reg == XED_REG_EBX && cr.bit_start == 0 &&
+                cr.bit_end == 7 && cr.value >= 2;
+            const bool avx10V2Aux =
+                cr.leaf == 0x24 && cr.subleaf == 1 &&
+                cr.reg == XED_REG_ECX && cr.bit_start == 3 &&
+                cr.bit_end == 3 && cr.value == 1;
+            if (avx10Version2 || avx10V2Aux) groupNeedsV2 = true;
+        }
+        if (!groupNeedsV2) return false;   // this group is satisfiable without AVX10.2
+    }
+    return anyGroup;
+}
+
+static const Tables& tables() {
+    static const Tables t = [] {
+        xed_tables_init();
+        Tables x;
+        x.isaFlags.assign(static_cast<size_t>(XED_ISA_SET_LAST), 0);
+        for (int i = 0; i < XED_ISA_SET_LAST; ++i) {
+            auto is = static_cast<xed_isa_set_enum_t>(i);
+            if (requiresAvx10_2(is)) x.isaFlags[i] |= REQUIRES_AVX10_2;
+        }
+        // Resolved by name so the build still succeeds on a XED without APX.
+        x.apxLegacy = str2xed_extension_enum_t("APXLEGACY");
+        x.apxEvex   = str2xed_extension_enum_t("APXEVEX");
+        x.preApx    = str2xed_chip_enum_t("GRANITE_RAPIDS");
+        return x;
+    }();
+    return t;
+}
+
+} // namespace xedcls
+
 static void scanIsaXed(const uint8_t* code, size_t len, bool is64,
                        IsaCounts& acc) {
-    // xed_tables_init() is idempotent-safe to call once; guard with a static.
-    static bool inited = false;
-    if (!inited) { xed_tables_init(); inited = true; }
+    const xedcls::Tables& T = xedcls::tables();
 
     xed_state_t dstate;
     xed_state_zero(&dstate);
@@ -577,24 +650,38 @@ static void scanIsaXed(const uint8_t* code, size_t len, bool is64,
         xed_decoded_inst_t xedd;
         xed_decoded_inst_zero_set_mode(&xedd, &dstate);
         unsigned int avail = static_cast<unsigned int>(
-            std::min<size_t>(len - off, 15)); // max x86 insn length
+            std::min<size_t>(len - off, XED_MAX_INSTRUCTION_BYTES));
         xed_error_enum_t err = xed_decode(&xedd, code + off, avail);
-        if (err == XED_ERROR_NONE) {
-            unsigned int ilen = xed_decoded_inst_get_length(&xedd);
-            // EVEX proxy: XED's stable public classifier for AVX-512/AVX10.
-            if (xed_classify_avx512(&xedd)) acc.evex++;
-            // ISA-set string is the most version-robust way to spot APX/AVX10.
-            xed_isa_set_enum_t iset = xed_decoded_inst_get_isa_set(&xedd);
-            const char* s = xed_isa_set_enum_t2str(iset);
-            if (s) {
-                std::string t = s;
-                if (t.find("APX") != std::string::npos) { acc.apx++; acc.rex2++; }
-                if (t.find("AVX10") != std::string::npos) acc.avx10++;
-            }
-            off += ilen ? ilen : 1;
-        } else {
-            off += 1; // resync on bad byte
-        }
+        if (err == XED_ERROR_BUFFER_TOO_SHORT) break; // tail shorter than one insn
+        if (err != XED_ERROR_NONE) { off += 1; continue; } // resync on bad byte
+
+        // vexvalid==2 is the EVEX encoding space itself. xed_classify_avx512()
+        // would miss APX-EVEX and would wrongly count the VEX-encoded mask ops.
+        if (xed3_operand_get_vexvalid(&xedd) == 2) acc.evex++;
+
+        bool rex2 = xed3_operand_get_rex2(&xedd) != 0;
+        if (rex2) acc.rex2++;
+
+        xed_isa_set_enum_t   iset = xed_decoded_inst_get_isa_set(&xedd);
+        xed_extension_enum_t ext  = xed_decoded_inst_get_extension(&xedd);
+        bool apx = rex2
+                || (T.apxLegacy != XED_EXTENSION_INVALID && ext == T.apxLegacy)
+                || (T.apxEvex   != XED_EXTENSION_INVALID && ext == T.apxEvex);
+        // Remaining flavor: an ordinary EVEX instruction using an EGPR keeps its
+        // original ISA-set, so only a chip check on the decoded instruction sees
+        // it. Gating on "ISA-set itself predates APX" keeps newer non-APX ISAs
+        // (e.g. AVX10.2) from being misattributed.
+        if (!apx && T.preApx != XED_CHIP_INVALID &&
+            xed_isa_set_is_valid_for_chip(iset, T.preApx) &&
+            !xed_decoded_inst_valid_for_chip(&xedd, T.preApx))
+            apx = true;
+        if (apx) acc.apx++;
+
+        if (static_cast<size_t>(iset) < T.isaFlags.size() &&
+            (T.isaFlags[iset] & xedcls::REQUIRES_AVX10_2))
+            acc.avx10++;
+
+        off += xed_decoded_inst_get_length(&xedd);
     }
 }
 #endif
@@ -604,6 +691,7 @@ static void finalizeIsa(Decoder dec, bool definitive, const IsaCounts& acc,
                         AnalysisResult& r) {
     r.rex2Count  = acc.rex2;
     r.evexCount  = acc.evex;
+    r.apxCount   = acc.apx;
     r.avx10Count = acc.avx10;
     r.definitive = definitive;
     r.decoderName = decoderName(dec);
@@ -612,8 +700,8 @@ static void finalizeIsa(Decoder dec, bool definitive, const IsaCounts& acc,
         r.apx     = (acc.apx > 0) || (acc.rex2 > 0);
         r.avx10_2 = (acc.avx10 > 0);
         os << r.decoderName << " decode across " << r.sectionsScanned
-           << " section(s): REX2/APX=" << acc.rex2 << " EVEX=" << acc.evex
-           << " APX-set=" << acc.apx << " AVX10-set=" << acc.avx10;
+           << " section(s): REX2-prefixed=" << acc.rex2 << " EVEX=" << acc.evex
+           << " APX-requiring=" << acc.apx << " AVX10.2-requiring=" << acc.avx10;
     } else {
         // Heuristic: never assert APX; only prove absence with 0 candidates.
         r.apx     = (acc.rex2 >= 4);
@@ -879,10 +967,11 @@ static void report(const AnalysisResult& r, bool verbose) {
         std::cout << "  APX (REX2) instructions  : N/A (non-x86 target)\n";
         std::cout << "  AVX10.2 instructions     : N/A (non-x86 target)\n";
     } else if (r.definitive) {
-        std::cout << "  APX (REX2) instructions  : " << yesNo(r.apx)
-                  << "  (definitive; REX2/APX insns=" << r.rex2Count << ")\n";
+        std::cout << "  APX instructions         : " << yesNo(r.apx)
+                  << "  (definitive; APX-requiring=" << r.apxCount
+                  << ", REX2-prefixed=" << r.rex2Count << ")\n";
         std::cout << "  AVX10.2 instructions     : " << yesNo(r.avx10_2)
-                  << "  (definitive; AVX10-set insns=" << r.avx10Count << ")\n";
+                  << "  (definitive; AVX10.2-requiring=" << r.avx10Count << ")\n";
     } else {
         std::cout << "  APX (REX2) instructions  : "
                   << (r.rex2Count == 0 ? "None found (heuristic)"
@@ -1011,6 +1100,7 @@ static void reportJson(const AnalysisResult& r) {
     }
     o << "    \"rex2Candidates\": " << r.rex2Count << ",\n";
     o << "    \"evexCount\": " << r.evexCount << ",\n";
+    o << "    \"apxCount\": " << r.apxCount << ",\n";
     o << "    \"avx10SetCount\": " << r.avx10Count << ",\n";
     o << "    \"detail\": " << (r.isaDetail.empty() ? "null" : jStr(r.isaDetail)) << "\n";
     o << "  },\n";

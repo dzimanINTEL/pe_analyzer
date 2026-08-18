@@ -122,8 +122,8 @@ success, `1` analysis failure (e.g. not a PE), `2` bad usage/invalid option.
   "isa": { "applicable": bool, "decoder": "heuristic|zydis|xed|n/a",
            "sectionsScanned": 0, "definitive": bool,
            "apx": bool|null, "avx10_2": bool|null,
-           "rex2Candidates": 0, "evexCount": 0, "avx10SetCount": 0,
-           "detail": "..."|null },
+           "rex2Candidates": 0, "evexCount": 0, "apxCount": 0,
+           "avx10SetCount": 0, "detail": "..."|null },
   "richHeader": [ ... ],
   "notes": [ ... ]
 }
@@ -144,8 +144,8 @@ candidates, or non‑x86 target) and `true`/`false` only when it can be asserted
 | **MSVC PGO** | Debug directory | `IMAGE_DEBUG_TYPE_POGO` (13) record ⇒ MSVC PGO/BBT layout data. |
 | **LLVM instrumentation PGO** | Sections/symbols | Presence of `__llvm_prf_cnts/_data/_names` (`.lprfc/.lprfn`). |
 | **HWPGO / sample PGO** | *Heuristic* | Sample/hardware PGO (AutoFDO/CSSPGO, `-fprofile-sample-use`) leaves **no** dedicated section, so this is best‑effort: option strings in debug info / `SampleProfile` markers. Reported as `Yes / No / Undetermined`. |
-| **APX** | Executable sections | Intel APX uses the 2‑byte **REX2** prefix `0xD5` (long mode only). Heuristic counts validated `0xD5` candidates; **Zydis build** decodes instructions and reads the APX ISA‑set (`ZYDIS_ATTRIB_HAS_REX2`) for a definitive answer. |
-| **AVX10.2** | Executable sections | AVX10.2 uses **extended EVEX** (`0x62`). EVEX alone cannot be distinguished from AVX‑512 by raw bytes, so the heuristic reports EVEX presence only; a **Zydis build** resolves the exact AVX10 ISA set. |
+| **APX** | Executable sections | Intel APX uses the 2‑byte **REX2** prefix `0xD5` (long mode only). Heuristic counts validated `0xD5` candidates; **Zydis build** reads `ZYDIS_ATTRIB_HAS_REX2`. The **XED build** counts all four APX flavors: the `REX2` prefix field, the `APXLEGACY`/`APXEVEX` extensions, and — for EVEX instructions using EGPRs, which get no new ISA‑set — a chip check of the decoded instruction against the newest pre‑APX chip. |
+| **AVX10.2** | Executable sections | AVX10.2 uses **extended EVEX** (`0x62`). EVEX alone cannot be distinguished from AVX‑512 by raw bytes, so the heuristic reports EVEX presence only. The **XED build** walks each ISA‑set's CPUID groups and counts an instruction only when *every* group requires AVX10 version ≥ 2 (CPUID leaf `0x24`); ISA‑sets such as `AVX512F_512` that also carry a legacy AVX‑512 group run on pre‑AVX10 hardware and are not counted. |
 
 ## Cross-checking the two decoders (`verify.py`)
 
