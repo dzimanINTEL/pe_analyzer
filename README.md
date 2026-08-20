@@ -120,7 +120,7 @@ success, `1` analysis failure (e.g. not a PE), `2` bad usage/invalid option.
   "pgo": { "msvcPogo": bool, "llvmInstrumentationPgo": bool,
            "hwpgo": bool|null, "hwpgoConfidence": "heuristic", "detail": "..."|null },
   "isa": { "applicable": bool, "decoder": "heuristic|zydis|xed|n/a",
-           "sectionsScanned": 0, "definitive": bool,
+           "sectionsScanned": 0, "definitive": bool, "avx10Resolvable": bool,
            "apx": bool|null, "avx10_2": bool|null,
            "rex2Candidates": 0, "evexCount": 0, "apxCount": 0,
            "avx10SetCount": 0, "detail": "..."|null },
@@ -132,6 +132,8 @@ success, `1` analysis failure (e.g. not a PE), `2` bad usage/invalid option.
 `apx` / `avx10_2` are `null` when the answer is unknown (heuristic with nonzero
 candidates, or non‑x86 target) and `true`/`false` only when it can be asserted
 (`definitive` decoding, or heuristic proving *absence* with zero candidates).
+`avx10Resolvable` is `false` when the selected decoder has no AVX10.2 tables at
+all (currently any Zydis build), in which case `avx10_2` is always `null`.
 
 ## How each fact is derived
 
@@ -144,8 +146,8 @@ candidates, or non‑x86 target) and `true`/`false` only when it can be asserted
 | **MSVC PGO** | Debug directory | `IMAGE_DEBUG_TYPE_POGO` (13) record ⇒ MSVC PGO/BBT layout data. |
 | **LLVM instrumentation PGO** | Sections/symbols | Presence of `__llvm_prf_cnts/_data/_names` (`.lprfc/.lprfn`). |
 | **HWPGO / sample PGO** | *Heuristic* | Sample/hardware PGO (AutoFDO/CSSPGO, `-fprofile-sample-use`) leaves **no** dedicated section, so this is best‑effort: option strings in debug info / `SampleProfile` markers. Reported as `Yes / No / Undetermined`. |
-| **APX** | Executable sections | Intel APX uses the 2‑byte **REX2** prefix `0xD5` (long mode only). Heuristic counts validated `0xD5` candidates; **Zydis build** reads `ZYDIS_ATTRIB_HAS_REX2`. The **XED build** counts all four APX flavors: the `REX2` prefix field, the `APXLEGACY`/`APXEVEX` extensions, and — for EVEX instructions using EGPRs, which get no new ISA‑set — a chip check of the decoded instruction against the newest pre‑APX chip. |
-| **AVX10.2** | Executable sections | AVX10.2 uses **extended EVEX** (`0x62`). EVEX alone cannot be distinguished from AVX‑512 by raw bytes, so the heuristic reports EVEX presence only. The **XED build** walks each ISA‑set's CPUID groups and counts an instruction only when *every* group requires AVX10 version ≥ 2 (CPUID leaf `0x24`); ISA‑sets such as `AVX512F_512` that also carry a legacy AVX‑512 group run on pre‑AVX10 hardware and are not counted. |
+| **APX** | Executable sections | Intel APX uses the 2‑byte **REX2** prefix `0xD5` (long mode only). Heuristic counts validated `0xD5` candidates. The **XED build** calls `xed_classify_apx()`, which covers all four flavors: the `REX2` prefix, EGPR register *or* memory operands, set-but-ignored APX EVEX bits, and the APX foundation ISA‑sets. The **Zydis build** uses `ZYDIS_ATTRIB_HAS_REX2` plus the `APX*` ISA‑set/extension names, which misses the EGPR‑only case and so reads slightly low. |
+| **AVX10.2** | Executable sections | AVX10.2 uses **extended EVEX** (`0x62`). EVEX alone cannot be distinguished from AVX‑512 by raw bytes, so the heuristic reports EVEX presence only. The **XED build** walks each ISA‑set's CPUID groups and counts an instruction only when *every* group requires AVX10 version ≥ 2 (leaf `0x24`, including the `AVX10_V2_AUX` bit); ISA‑sets such as `AVX512F_512` that also carry a legacy AVX‑512 group run on pre‑AVX10 hardware and are not counted. **Zydis cannot answer this at all** — through v5 it ships no AVX10.2 mnemonics or ISA‑sets — so it reports `Undetermined` / `null` rather than a false `No`. |
 
 ## Cross-checking the two decoders (`verify.py`)
 
@@ -161,7 +163,9 @@ python verify.py --bin ./build/petool a.dll --include-heuristic   # extra contex
 ```
 
 Per file it prints one of **AGREE / MISMATCH / SKIPPED / ERROR** plus a small
-APX/AVX10.2/REX2/EVEX table. **Exit codes** make it CI-friendly:
+APX/AVX10.2/REX2/EVEX table. A feature that one backend cannot resolve (`null`,
+such as AVX10.2 under Zydis) is reported as *not comparable* rather than scored
+as a disagreement. **Exit codes** make it CI-friendly:
 `0` = all comparable files agree, `1` = at least one **mismatch**, `2` = usage /
 no PE files, `3` = a backend was unavailable or `petool` failed. Non-PE inputs
 and non-x86 targets are **skipped** (not errors); a `zydis`/`xed` request that
@@ -186,7 +190,14 @@ Windows jobs load the MSVC dev environment so both CMake and XED's `mfile.py` fi
   immediates produce false positives. The heuristic output therefore says
   *“None found / Undetermined (heuristic)”* and never a hard *Yes*. Build with
   `-DWITH_ZYDIS=ON` and/or `-DWITH_XED=ON` and run `--decoder=zydis|xed` for a
-  definitive result (both provide APX and AVX10 ISA‑set metadata).
+  definitive result. Only **XED** can resolve AVX10.2; Zydis provides APX
+  metadata but has no AVX10.2 tables.
+* **A single stray decode can flip the APX verdict.** The scan is a linear sweep
+  with `+1` resync, so data, jump tables and padding occasionally decode as
+  REX2-prefixed instructions. Because the verdict is "any APX instruction
+  found", a known non-APX image such as `mshtml.dll` still reports `APX: Yes`
+  off 8 spurious hits in 17.8 MB. Treat low counts as noise and compare against
+  the counts, not just the boolean.
 * **Non‑x86 targets** (e.g. ARM64) report APX/AVX10.2 as **N/A** — the x86 ISA
   scan is skipped entirely.
 * **Command‑line options** are only fully recoverable from the **PDB**; the tool

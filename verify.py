@@ -147,16 +147,27 @@ def compare(path: str, binary: str, include_heuristic: bool) -> FileResult:
         return fr
 
     diffs = []
+    skipped = []
     for k in COMPARE_KEYS:
         zv, xv = getattr(z, k), getattr(x, k)
+        # null means the backend cannot resolve that feature at all (e.g. Zydis
+        # has no AVX10.2 tables). That is not a disagreement, so don't score it.
+        if zv is None or xv is None:
+            skipped.append(k)
+            continue
         if zv != xv:
             diffs.append(f"{k}: zydis={zv} xed={xv}")
     if diffs:
         fr.status = "mismatch"
         fr.detail = "; ".join(diffs)
+    elif len(skipped) == len(COMPARE_KEYS):
+        fr.status = "skipped"
+        fr.detail = "no feature comparable across both decoders: " + ", ".join(skipped)
     else:
         fr.status = "agree"
         fr.detail = f"apx={z.apx} avx10_2={z.avx10_2}"
+        if skipped:
+            fr.detail += " (not comparable: " + ", ".join(skipped) + ")"
     return fr
 
 
